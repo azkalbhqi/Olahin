@@ -38,7 +38,7 @@ def run_normality_test(
         if std == 0:
             stat, p_val = 0.0, 0.0
         else:
-            stat, p_val = stats.kstest(data, 'norm', args=(mean, std))
+            stat, p_val = stats.kstest(data, stats.norm(loc=mean, scale=std).cdf)
         test_name = "Kolmogorov-Smirnov"
         
     # Handle NaN p-values
