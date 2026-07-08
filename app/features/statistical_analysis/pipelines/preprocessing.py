@@ -2,158 +2,202 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Tuple, Any
 from fastapi import HTTPException
+from sklearn.base import BaseEstimator, TransformerMixin
+
+class TypeConverter(BaseEstimator, TransformerMixin):
+    """
+    Scikit-learn compatible transformer for type inference and conversion.
+    """
+    def __init__(self, selected_columns: List[str]):
+        self.selected_columns = selected_columns
+        self.actions_taken = []
+        self.data_types = {}
+        
+    def fit(self, X, y=None):
+        return self
+        
+    def transform(self, X, y=None):
+        X = X.copy()
+        for col in self.selected_columns:
+            if col not in X.columns:
+                raise HTTPException(status_code=400, detail=f"Kolom '{col}' tidak ditemukan dalam dataset.")
+                
+            series = X[col]
+            
+            # Object to numeric if <= 20% NaN conversion loss
+            if series.dtype == 'object':
+                converted = pd.to_numeric(series, errors='coerce')
+                # If less than 20% of values become NaN, we treat it as numeric
+                if (converted.isna().sum() - series.isna().sum()) < 0.2 * len(series):
+                    X[col] = converted
+                    self.actions_taken.append(f"Kolom '{col}' dikonversi ke tipe numerik.")
+                    
+            if pd.api.types.is_numeric_dtype(X[col]):
+                self.data_types[col] = "numerical"
+            else:
+                X[col] = X[col].astype(str)
+                # Replace 'nan' string back to actual NaN
+                X[col] = X[col].replace('nan', np.nan)
+                self.data_types[col] = "categorical"
+        return X
+
+class MissingValueHandler(BaseEstimator, TransformerMixin):
+    """
+    Scikit-learn compatible transformer for missing value drop and imputation.
+    """
+    def __init__(self, selected_columns: List[str], data_types: Dict[str, str]):
+        self.selected_columns = selected_columns
+        self.data_types = data_types
+        self.missing_values = {}
+        self.actions_taken = []
+        
+    def fit(self, X, y=None):
+        return self
+        
+    def transform(self, X, y=None):
+        X = X.copy()
+        to_drop_cols = []
+        to_impute_cols = []
+        total_rows = len(X)
+        
+        if total_rows == 0:
+            return X
+            
+        for col in self.selected_columns:
+            missing_count = X[col].isna().sum()
+            if missing_count == 0:
+                self.missing_values[col] = {"count": 0, "percentage": 0.0, "strategy": "none"}
+                continue
+                
+            pct = (missing_count / total_rows) * 100
+            self.missing_values[col] = {"count": int(missing_count), "percentage": round(pct, 2)}
+            
+            if pct < 5.0:
+                to_drop_cols.append(col)
+                self.missing_values[col]["strategy"] = "drop"
+            else:
+                to_impute_cols.append(col)
+                self.missing_values[col]["strategy"] = "impute"
+                
+        # Drop columns with low missingness (< 5%)
+        if to_drop_cols:
+            before_drop = len(X)
+            X = X.dropna(subset=to_drop_cols)
+            dropped_count = before_drop - len(X)
+            if dropped_count > 0:
+                self.actions_taken.append(
+                    f"Menghapus {dropped_count} baris yang memiliki nilai kosong pada kolom: {', '.join(to_drop_cols)} (karena data kosong < 5%)."
+                )
+                
+        # Imputations for columns with high missingness (>= 5%)
+        for col in to_impute_cols:
+            col_type = self.data_types.get(col, "numerical")
+            missing_count = X[col].isna().sum()
+            if missing_count == 0:
+                continue
+                
+            if col_type == "numerical":
+                median_val = X[col].median()
+                if pd.isna(median_val):
+                    median_val = 0.0
+                X[col] = X[col].fillna(median_val)
+                self.actions_taken.append(
+                    f"Mengimputasi {missing_count} nilai kosong pada kolom '{col}' dengan nilai Median ({median_val:.2f}) (karena data kosong >= 5%)."
+                )
+                self.missing_values[col]["imputed_value"] = float(median_val)
+            else:
+                mode_series = X[col].mode()
+                mode_val = mode_series.iloc[0] if not mode_series.empty else "Unknown"
+                X[col] = X[col].fillna(mode_val)
+                self.actions_taken.append(
+                    f"Mengimputasi {missing_count} nilai kosong pada kolom '{col}' dengan nilai Modus ('{mode_val}') (karena data kosong >= 5%)."
+                )
+                self.missing_values[col]["imputed_value"] = str(mode_val)
+                
+        return X
+
+class OutlierFilter(BaseEstimator, TransformerMixin):
+    """
+    Scikit-learn compatible transformer for outlier filtering using IQR.
+    """
+    def __init__(self, selected_columns: List[str], data_types: Dict[str, str]):
+        self.selected_columns = selected_columns
+        self.data_types = data_types
+        self.outliers_removed = {}
+        self.actions_taken = []
+        
+    def fit(self, X, y=None):
+        return self
+        
+    def transform(self, X, y=None):
+        X = X.copy()
+        for col in self.selected_columns:
+            if self.data_types.get(col) == "numerical":
+                col_series = X[col]
+                if len(col_series) < 4:
+                    self.outliers_removed[col] = {"count": 0}
+                    continue
+                    
+                q1 = col_series.quantile(0.25)
+                q3 = col_series.quantile(0.75)
+                iqr = q3 - q1
+                
+                lower_bound = q1 - 1.5 * iqr
+                upper_bound = q3 + 1.5 * iqr
+                
+                outliers = X[(X[col] < lower_bound) | (X[col] > upper_bound)]
+                outlier_count = len(outliers)
+                
+                if outlier_count > 0:
+                    X = X[(X[col] >= lower_bound) & (X[col] <= upper_bound)]
+                    self.outliers_removed[col] = {
+                        "count": outlier_count,
+                        "lower_bound": round(lower_bound, 4),
+                        "upper_bound": round(upper_bound, 4)
+                    }
+                    self.actions_taken.append(
+                        f"Mendeteksi dan menghapus {outlier_count} baris outlier pada kolom '{col}' dengan rentang IQR [{lower_bound:.2f}, {upper_bound:.2f}]."
+                    )
+                else:
+                    self.outliers_removed[col] = {"count": 0}
+        return X
 
 def run_preprocessing(
     df: pd.DataFrame, 
     selected_columns: List[str]
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Executes automated preprocessing on the DataFrame for the selected columns.
-    
-    Steps:
-    1. Data Type Inference & Conversion
-    2. Missing Value Handling (Drop if < 5%, Impute if >= 5%)
-    3. Outlier Filtering using IQR for numerical columns
-    
-    Returns the cleaned DataFrame and a dictionary containing logs of the operations.
+    Executes automated preprocessing on the DataFrame using the scikit-learn components.
     """
-    cleaned_df = df.copy()
-    logs = {
-        "initial_rows": len(cleaned_df),
-        "data_types": {},
-        "missing_values": {},
-        "outliers_removed": {},
-        "final_rows": 0,
-        "actions_taken": []
-    }
-    
-    if len(cleaned_df) == 0:
+    if len(df) == 0:
         raise HTTPException(status_code=400, detail="Dataset kosong.")
         
-    # --- 1. Data Type Inference & Conversion ---
-    for col in selected_columns:
-        if col not in cleaned_df.columns:
-            raise HTTPException(status_code=400, detail=f"Kolom '{col}' tidak ditemukan dalam dataset.")
-            
-        # Try to convert to numeric if appropriate
-        col_series = cleaned_df[col]
-        
-        # If it's object type but contains numeric-like data, convert it
-        if col_series.dtype == 'object':
-            # Check if we can convert it without losing too much data
-            converted = pd.to_numeric(col_series, errors='coerce')
-            # If less than 20% of values become NaN, we treat it as numeric
-            if converted.isna().sum() - col_series.isna().sum() < 0.2 * len(col_series):
-                cleaned_df[col] = converted
-                logs["actions_taken"].append(f"Kolom '{col}' dikonversi ke tipe numerik.")
-                
-        # Final inference check
-        if pd.api.types.is_numeric_dtype(cleaned_df[col]):
-            logs["data_types"][col] = "numerical"
-        else:
-            # Cast categorical columns to string for consistency
-            cleaned_df[col] = cleaned_df[col].astype(str)
-            # Replace 'nan' string (resulting from cast of NaN) back to actual NaN
-            cleaned_df[col] = cleaned_df[col].replace('nan', np.nan)
-            logs["data_types"][col] = "categorical"
-
-    # --- 2. Handling Missing Values ---
-    # First, separate columns by missing value percentages
-    to_drop_cols = []
-    to_impute_cols = []
+    # Run sequentially
+    converter = TypeConverter(selected_columns)
+    df_converted = converter.fit_transform(df)
     
-    total_rows = len(cleaned_df)
+    imputer = MissingValueHandler(selected_columns, converter.data_types)
+    df_imputed = imputer.fit_transform(df_converted)
     
-    for col in selected_columns:
-        missing_count = cleaned_df[col].isna().sum()
-        if missing_count == 0:
-            logs["missing_values"][col] = {"count": 0, "percentage": 0.0, "strategy": "none"}
-            continue
-            
-        pct = (missing_count / total_rows) * 100
-        logs["missing_values"][col] = {"count": int(missing_count), "percentage": round(pct, 2)}
-        
-        if pct < 5.0:
-            to_drop_cols.append(col)
-            logs["missing_values"][col]["strategy"] = "drop"
-        else:
-            to_impute_cols.append(col)
-            logs["missing_values"][col]["strategy"] = "impute"
-
-    # Execute Drops
-    if to_drop_cols:
-        before_drop = len(cleaned_df)
-        cleaned_df = cleaned_df.dropna(subset=to_drop_cols)
-        dropped_count = before_drop - len(cleaned_df)
-        if dropped_count > 0:
-            logs["actions_taken"].append(
-                f"Menghapus {dropped_count} baris yang memiliki nilai kosong pada kolom: {', '.join(to_drop_cols)} (karena data kosong < 5%)."
-            )
-
-    # Execute Imputations
-    for col in to_impute_cols:
-        col_type = logs["data_types"][col]
-        missing_count = cleaned_df[col].isna().sum()
-        if missing_count == 0:
-            continue
-            
-        if col_type == "numerical":
-            median_val = cleaned_df[col].median()
-            # If median is NaN (all values are NaN), use 0
-            if pd.isna(median_val):
-                median_val = 0.0
-            cleaned_df[col] = cleaned_df[col].fillna(median_val)
-            logs["actions_taken"].append(
-                f"Mengimputasi {missing_count} nilai kosong pada kolom '{col}' dengan nilai Median ({median_val:.2f}) (karena data kosong >= 5%)."
-            )
-            logs["missing_values"][col]["imputed_value"] = float(median_val)
-        else:
-            # Categorical imputation using mode
-            mode_series = cleaned_df[col].mode()
-            mode_val = mode_series.iloc[0] if not mode_series.empty else "Unknown"
-            cleaned_df[col] = cleaned_df[col].fillna(mode_val)
-            logs["actions_taken"].append(
-                f"Mengimputasi {missing_count} nilai kosong pada kolom '{col}' dengan nilai Modus ('{mode_val}') (karena data kosong >= 5%)."
-            )
-            logs["missing_values"][col]["imputed_value"] = str(mode_val)
-
-    # --- 3. Outlier Filtering (IQR) ---
-    # We only apply IQR to numerical columns
-    for col in selected_columns:
-        if logs["data_types"][col] == "numerical":
-            col_series = cleaned_df[col]
-            q1 = col_series.quantile(0.25)
-            q3 = col_series.quantile(0.75)
-            iqr = q3 - q1
-            
-            lower_bound = q1 - 1.5 * iqr
-            upper_bound = q3 + 1.5 * iqr
-            
-            # Find outliers
-            outliers = cleaned_df[(cleaned_df[col] < lower_bound) | (cleaned_df[col] > upper_bound)]
-            outlier_count = len(outliers)
-            
-            if outlier_count > 0:
-                # Filter out outliers
-                cleaned_df = cleaned_df[(cleaned_df[col] >= lower_bound) & (cleaned_df[col] <= upper_bound)]
-                logs["outliers_removed"][col] = {
-                    "count": outlier_count,
-                    "lower_bound": round(lower_bound, 4),
-                    "upper_bound": round(upper_bound, 4)
-                }
-                logs["actions_taken"].append(
-                    f"Mendeteksi dan menghapus {outlier_count} baris outlier pada kolom '{col}' dengan rentang IQR [{lower_bound:.2f}, {upper_bound:.2f}]."
-                )
-            else:
-                logs["outliers_removed"][col] = {"count": 0}
-
-    logs["final_rows"] = len(cleaned_df)
+    outlier_remover = OutlierFilter(selected_columns, converter.data_types)
+    df_cleaned = outlier_remover.fit_transform(df_imputed)
     
-    if len(cleaned_df) < 5:
+    actions = converter.actions_taken + imputer.actions_taken + outlier_remover.actions_taken
+    
+    logs = {
+        "initial_rows": len(df),
+        "data_types": converter.data_types,
+        "missing_values": imputer.missing_values,
+        "outliers_removed": outlier_remover.outliers_removed,
+        "final_rows": len(df_cleaned),
+        "actions_taken": actions
+    }
+    
+    if len(df_cleaned) < 5:
         raise HTTPException(
             status_code=400,
-            detail=f"Data setelah pembersihan terlalu sedikit (hanya {len(cleaned_df)} baris). "
+            detail=f"Data setelah pembersihan terlalu sedikit (hanya {len(df_cleaned)} baris). "
                    "Gagal melanjutkan analisis statistik. Silakan periksa kembali dataset Anda."
         )
         
-    return cleaned_df, logs
+    return df_cleaned, logs

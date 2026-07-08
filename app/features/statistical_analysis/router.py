@@ -12,13 +12,6 @@ from app.features.statistical_analysis.pipelines.ingestion import (
     load_dataframe
 )
 from app.features.statistical_analysis.pipelines.preprocessing import run_preprocessing
-from app.features.statistical_analysis.pipelines.statistics import execute_routing_and_analysis
-from app.features.statistical_analysis.pipelines.interpretation import generate_narrative_interpretation
-from app.features.statistical_analysis.pipelines.visualization import (
-    generate_plot,
-    encode_image_base64,
-    create_docx_report
-)
 
 router = APIRouter(
     prefix="/api/statistical-analysis",
@@ -28,8 +21,6 @@ router = APIRouter(
 def get_base_url(request: Request) -> str:
     """
     Dapatkan base URL untuk menghasilkan tautan unduhan absolut.
-    Pertama memeriksa konfigurasi BACKEND_URL, lalu header X-Forwarded (untuk proxy),
-    dan jika tidak ada, fallback ke request.base_url bawaan.
     """
     from app.config import BACKEND_URL
     if BACKEND_URL:
@@ -57,72 +48,183 @@ async def upload_file(file: UploadFile = File(..., description="File data (.csv,
 async def analyze_data(request: AnalysisRequest, req: Request):
     """
     Menjalankan pipeline preprocessing, analisis statistik, interpretasi naratif,
-    dan pembuatan laporan .docx lengkap dengan grafik.
+    dan pembuatan laporan .docx & .pdf lengkap dengan grafik.
     """
     # 1. Load DataFrame (Pipeline 1 helper)
     df, ext = load_dataframe(request.file_id)
     
-    # Identify variables of interest
-    target_columns = []
+    # Backwards compatibility & Mapping analysis_goal
+    goal = request.analysis_goal
+    if request.analysis_type and not request.analysis_goal:
+        if request.analysis_type == "Asosiatif":
+            goal = "pengaruh"
+        elif request.analysis_type == "Komparatif":
+            goal = "komparasi"
+            
+    # Check early if it is a Time-Series Path (FR-05)
+    is_ts = False
+    time_column = request.time_col
     
-    # Append dependent variable
+    from app.features.statistical_analysis.pipelines.ingestion import detect_data_structure
+    data_struct, detected_time_col = detect_data_structure(df)
+    
+    if time_column:
+        is_ts = True
+    elif data_struct == "time_series":
+        # Only route to time_series automatically if not doing other specific comparative/mediation goals
+        if goal not in ["komparasi", "korelasi", "mediasi_moderasi"]:
+            is_ts = True
+            time_column = detected_time_col
+            
+    # Validate request fields based on path
     if not request.dependent_var:
         raise HTTPException(status_code=400, detail="Variabel dependen wajib diisi.")
-    target_columns.append(request.dependent_var)
+        
+    target_columns = [request.dependent_var]
     
-    # Append independent variables (for associative)
-    if request.analysis_type == "Asosiatif":
-        if not request.independent_vars:
-            raise HTTPException(status_code=400, detail="Variabel independen harus dipilih minimal satu.")
-        for var in request.independent_vars:
-            if var not in target_columns:
-                target_columns.append(var)
-                
-    # Append grouping variable (for comparative)
-    elif request.analysis_type == "Komparatif":
-        if not request.group_var:
-            raise HTTPException(status_code=400, detail="Variabel grup (group_var) wajib diisi untuk analisis komparatif.")
-        if request.group_var not in target_columns:
+    if is_ts:
+        # Time-Series: independent variables are optional (univariate ARIMA vs multivariate VAR)
+        if request.independent_vars:
+            for var in request.independent_vars:
+                if var not in target_columns:
+                    target_columns.append(var)
+        if time_column and time_column not in target_columns:
+            target_columns.append(time_column)
+    else:
+        # Cross-Sectional validation rules
+        if goal == "komparasi":
+            if not request.group_var:
+                raise HTTPException(status_code=400, detail="Variabel grup (group_var) wajib diisi untuk analisis komparatif.")
             target_columns.append(request.group_var)
-            
+        elif goal == "pengaruh" or goal == "korelasi":
+            if not request.independent_vars:
+                raise HTTPException(status_code=400, detail="Variabel independen harus dipilih minimal satu.")
+            for var in request.independent_vars:
+                if var not in target_columns:
+                    target_columns.append(var)
+        elif goal == "mediasi_moderasi":
+            if not request.independent_vars:
+                raise HTTPException(status_code=400, detail="Variabel independen (X) harus dipilih.")
+            for var in request.independent_vars:
+                if var not in target_columns:
+                    target_columns.append(var)
+            if not request.mediator_var:
+                raise HTTPException(status_code=400, detail="Variabel mediator (mediator_var) harus ditentukan.")
+            if request.mediator_var not in target_columns:
+                target_columns.append(request.mediator_var)
+                
     # 2. Run Preprocessing Engine (Pipeline 2)
     cleaned_df, prep_log = run_preprocessing(df, target_columns)
     
-    # 3. Statistical Routing and Execution (Pipeline 3)
-    normality_res, analysis_res = execute_routing_and_analysis(
-        df=cleaned_df,
-        analysis_type=request.analysis_type,
-        independent_vars=request.independent_vars,
-        dependent_var=request.dependent_var,
-        group_var=request.group_var
-    )
+    descriptive_stats = {}
+    instrument_res = None
+    ts_results = None
+    normality_res = {}
+    routing_info = {}
+    analysis_res = {}
     
+    if is_ts:
+        # --- Time-Series Path ---
+        from app.features.statistical_analysis.pipelines.statistics import run_time_series_path
+        ts_results = run_time_series_path(
+            df=cleaned_df,
+            dependent_var=request.dependent_var,
+            independent_vars=request.independent_vars,
+            time_col=time_column
+        )
+        
+        routing_info = {
+            "chosen_test": ts_results["model_type"],
+            "is_parametric": True
+        }
+        
+        # Format dummy standard metrics for compatibility in client response
+        analysis_res = ts_results["model_details"]
+        analysis_res["model_type"] = ts_results["model_type"]
+        analysis_res["is_parametric"] = True
+        
+        normality_res = {
+            "test_name": "KPSS & ADF (Stasioneritas)",
+            "sample_size": len(cleaned_df),
+            "statistic": 0.0,
+            "p_value": 1.0,
+            "is_normal": True
+        }
+    else:
+        # --- Cross-Sectional Path ---
+        # A. Instrument Validation for questionnaires
+        if request.data_source == "questionnaire":
+            from app.features.statistical_analysis.pipelines.statistics import run_instrument_validation
+            instrument_res = run_instrument_validation(cleaned_df, request.independent_vars)
+            
+        # B. Run Descriptive Stats
+        from app.features.statistical_analysis.pipelines.statistics import run_descriptive_analysis
+        desc_cols = [request.dependent_var]
+        for var in request.independent_vars:
+            if var not in desc_cols:
+                desc_cols.append(var)
+        if request.mediator_var and request.mediator_var not in desc_cols:
+            desc_cols.append(request.mediator_var)
+            
+        descriptive_stats = run_descriptive_analysis(cleaned_df, desc_cols)
+        
+        # C. Run Routing & Hypothesis Analysis
+        from app.features.statistical_analysis.pipelines.statistics import execute_routing_and_analysis
+        normality_res, analysis_res = execute_routing_and_analysis(
+            df=cleaned_df,
+            analysis_goal=goal,
+            independent_vars=request.independent_vars,
+            dependent_var=request.dependent_var,
+            group_var=request.group_var,
+            is_paired=request.is_paired,
+            mediator_var=request.mediator_var,
+            alpha=request.alpha
+        )
+        
+        routing_info = {
+            "chosen_test": analysis_res["model_type"],
+            "is_parametric": analysis_res["is_parametric"]
+        }
+        
     # 4. Generate Narrative Interpretation (Pipeline 4)
+    from app.features.statistical_analysis.pipelines.interpretation import generate_narrative_interpretation
     narrative = generate_narrative_interpretation(
         normality_results=normality_res,
         analysis_results=analysis_res,
         independent_vars=request.independent_vars,
         dependent_var=request.dependent_var,
-        group_var=request.group_var
+        group_var=request.group_var,
+        descriptive_stats=descriptive_stats,
+        instrument_validation=instrument_res,
+        time_series_results=ts_results,
+        alpha=request.alpha
     )
     
-    # 5. Visualization & Export Report (Pipeline 5)
-    model_type = analysis_res["model_type"]
+    # 5. Visualization & Export Reports (Pipeline 5)
+    from app.features.statistical_analysis.pipelines.visualization import (
+        generate_plot,
+        encode_image_base64,
+        create_docx_report,
+        create_pdf_report
+    )
+    
     plot_buf = generate_plot(
         df=cleaned_df,
-        model_type=model_type,
+        model_type=routing_info["chosen_test"],
         independent_vars=request.independent_vars,
         dependent_var=request.dependent_var,
-        group_var=request.group_var
+        group_var=request.group_var,
+        time_col=time_column,
+        time_series_results=ts_results,
+        analysis_results=analysis_res
     )
     
     plot_b64 = encode_image_base64(plot_buf)
     
-    # Find original file name
-    # We can reconstruct it or read it. Let's pass a generic name or check upload log
-    # For now, let's name it based on the analysis type
+    # Word docx report
     report_filename = create_docx_report(
         file_id=request.file_id,
+        research_title=request.research_title,
         filename=f"Data_{request.file_id}{ext}",
         preprocessing_log=prep_log,
         normality_results=normality_res,
@@ -131,17 +233,33 @@ async def analyze_data(request: AnalysisRequest, req: Request):
         dependent_var=request.dependent_var,
         narrative=narrative,
         plot_buf=plot_buf,
-        group_var=request.group_var
+        group_var=request.group_var,
+        descriptive_stats=descriptive_stats,
+        instrument_validation=instrument_res,
+        time_series_results=ts_results
     )
     
-    # Determine local/server base URL to build the download link (supporting reverse proxies & env BACKEND_URL)
+    # PDF report
+    pdf_filename = create_pdf_report(
+        file_id=request.file_id,
+        research_title=request.research_title,
+        filename=f"Data_{request.file_id}{ext}",
+        preprocessing_log=prep_log,
+        normality_results=normality_res,
+        analysis_results=analysis_res,
+        independent_vars=request.independent_vars,
+        dependent_var=request.dependent_var,
+        narrative=narrative,
+        plot_buf=plot_buf,
+        group_var=request.group_var,
+        descriptive_stats=descriptive_stats,
+        instrument_validation=instrument_res,
+        time_series_results=ts_results
+    )
+    
     base_url = get_base_url(req)
     report_url = f"{base_url}api/statistical-analysis/download/{report_filename}"
-    
-    routing_info = {
-        "chosen_test": model_type,
-        "is_parametric": analysis_res["is_parametric"]
-    }
+    report_pdf_url = f"{base_url}api/statistical-analysis/download/{pdf_filename}"
     
     return AnalysisResponse(
         file_id=request.file_id,
@@ -149,17 +267,20 @@ async def analyze_data(request: AnalysisRequest, req: Request):
         normality_test=normality_res,
         routing=routing_info,
         statistics=analysis_res,
+        descriptive_stats=descriptive_stats,
+        instrument_validation=instrument_res,
+        time_series_results=ts_results,
         narrative=narrative,
         plot_base64=plot_b64,
-        report_url=report_url
+        report_url=report_url,
+        report_pdf_url=report_pdf_url
     )
 
-@router.get("/download/{filename}", summary="Unduh File Laporan Word")
+@router.get("/download/{filename}", summary="Unduh File Laporan (Word atau PDF)")
 async def download_report(filename: str):
     """
-    Mengunduh file laporan dalam format Word (.docx) berdasarkan nama file.
+    Mengunduh file laporan dalam format Word (.docx) atau PDF (.pdf) berdasarkan nama file.
     """
-    # Mencegah serangan path traversal dengan membersihkan nama file
     safe_filename = os.path.basename(filename)
     file_path = os.path.join(EXPORT_DIR, safe_filename)
     if not os.path.exists(file_path):
@@ -168,9 +289,15 @@ async def download_report(filename: str):
             detail="File laporan tidak ditemukan atau sudah kedaluwarsa."
         )
         
+    _, ext = os.path.splitext(safe_filename.lower())
+    if ext == ".pdf":
+        media_type = "application/pdf"
+    else:
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        
     return FileResponse(
         path=file_path,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        media_type=media_type,
         filename=safe_filename
     )
 
@@ -179,7 +306,6 @@ async def download_raw_file(filename: str):
     """
     Mengunduh file data mentah (.csv, .xlsx, .xls) yang telah diunggah sebelumnya.
     """
-    # Mencegah serangan path traversal dengan membersihkan nama file
     safe_filename = os.path.basename(filename)
     file_path = os.path.join(UPLOAD_DIR, safe_filename)
     if not os.path.exists(file_path):
@@ -188,7 +314,6 @@ async def download_raw_file(filename: str):
             detail="File data mentah tidak ditemukan."
         )
         
-    # Tentukan media_type berdasarkan ekstensi file
     _, ext = os.path.splitext(safe_filename.lower())
     if ext == ".csv":
         media_type = "text/csv"

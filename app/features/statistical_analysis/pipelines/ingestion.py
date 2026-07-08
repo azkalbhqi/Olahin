@@ -1,6 +1,6 @@
 import os
 import uuid
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 import pandas as pd
 from fastapi import UploadFile, HTTPException
 from app.config import UPLOAD_DIR
@@ -29,6 +29,29 @@ def infer_column_type(series: pd.Series) -> str:
         # but standard routing is based on dtype.
         return "numerical"
     return "categorical"
+
+def detect_data_structure(df: pd.DataFrame) -> Tuple[str, Optional[str]]:
+    """
+    Detects if the dataframe is a time series or cross-sectional.
+    Looks for datetime columns or date-like column names.
+    """
+    time_keywords = ['date', 'time', 'year', 'month', 'day', 'tanggal', 'tahun', 'bulan', 'hari', 'timestamp']
+    for col in df.columns:
+        col_lower = str(col).lower()
+        if any(kw in col_lower for kw in time_keywords):
+            try:
+                # Avoid converting completely unrelated strings by checking if conversion succeeds
+                parsed = pd.to_datetime(df[col], errors='coerce')
+                if parsed.notna().sum() > 0.8 * len(df):
+                    return "time_series", str(col)
+            except Exception:
+                pass
+                
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            return "time_series", str(col)
+            
+    return "cross_sectional", None
 
 def save_and_ingest_file(file: UploadFile) -> Dict[str, Any]:
     """
@@ -80,8 +103,20 @@ def save_and_ingest_file(file: UploadFile) -> Dict[str, Any]:
     col_count = len(df.columns)
     columns = df.columns.tolist()
     
+    # Check minimum row count
+    if row_count < 5:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Data terlalu sedikit (hanya {row_count} baris). Minimum data yang diperlukan adalah 5 baris."
+        )
+        
     # Infer basic data types for columns
     column_types = {col: infer_column_type(df[col]) for col in columns}
+    
+    # Detect structure
+    data_struct, time_col = detect_data_structure(df)
     
     return {
         "file_id": file_id,
@@ -89,7 +124,8 @@ def save_and_ingest_file(file: UploadFile) -> Dict[str, Any]:
         "row_count": row_count,
         "col_count": col_count,
         "columns": columns,
-        "column_types": column_types
+        "column_types": column_types,
+        "data_structure": data_struct
     }
 
 def load_dataframe(file_id: str) -> Tuple[pd.DataFrame, str]:
